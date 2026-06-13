@@ -1,0 +1,67 @@
+{
+  "name": "intently",
+  "version": "0.1.0",
+  "description": "Intent-aware prefetching. Predicts where the cursor is headed — proximity + trajectory — and prefetches (or prerenders via the Speculation Rules API) the link a beat before the click. Zero-config, ~3.5KB, framework-agnostic.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Sean Geng (https://seangeng.com)",
+  "homepage": "https://github.com/seangeng/intently#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seangeng/intently.git"
+  },
+  "bugs": "https://github.com/seangeng/intently/issues",
+  "keywords": [
+    "prefetch",
+    "prerender",
+    "preload",
+    "speculation-rules",
+    "performance",
+    "web-performance",
+    "navigation",
+    "intent",
+    "predictive-prefetch",
+    "quicklink",
+    "instant-page",
+    "trajectory"
+  ],
+  "sideEffects": false,
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./react": {
+      "types": "./dist/react.d.ts",
+      "import": "./dist/react.js",
+      "require": "./dist/react.cjs"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "peerDependencies": {
+    "react": ">=17"
+  },
+  "peerDependenciesMeta": {
+    "react": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/react": "^18.3.12",
+    "react": "^18.3.1",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2"
+  }
+}
