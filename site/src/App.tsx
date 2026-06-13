@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from "react";
+import { Highlight, themes } from "prism-react-renderer";
 import { proximityScore, trajectoryScore, updateVelocity, type Velocity } from "intently";
 
 const LINKS = [
@@ -21,8 +22,7 @@ const srSupported =
 function LiveDemo() {
   const zoneRef = useRef<HTMLDivElement>(null);
   const cardRefs = useRef<(HTMLAnchorElement | null)[]>([]);
-  const [conf, setConf] = useState<number[]>(() => LINKS.map(() => 0));
-  const [state, setState] = useState<("idle" | Tier)[]>(() => LINKS.map(() => "idle"));
+  const [tiers, setTiers] = useState<("idle" | Tier)[]>(() => LINKS.map(() => "idle"));
   const [log, setLog] = useState<LogEntry[]>([]);
 
   const pointer = useRef<{ x: number; y: number } | null>(null);
@@ -33,6 +33,7 @@ function LiveDemo() {
   // Cache link rects so the hot loop never calls getBoundingClientRect — only
   // re-measure on resize and when the pointer (re-)enters the stage.
   const rects = useRef<(DOMRect | null)[]>([]);
+  const tierRef = useRef<("idle" | Tier)[]>(LINKS.map(() => "idle"));
   function measure() {
     rects.current = cardRefs.current.map((el) => el?.getBoundingClientRect() ?? null);
   }
@@ -43,22 +44,33 @@ function LiveDemo() {
     return () => window.removeEventListener("resize", measure);
   }, []);
 
+  // Paint a card's confidence straight to the DOM. The hot path never touches
+  // React state, so there's no 60fps reconcile — that was the jank.
+  function paint(el: HTMLAnchorElement, c: number, tier: "idle" | Tier) {
+    const rgb = tier === "prerender" ? "34,197,94" : "59,130,246";
+    el.style.setProperty("--c", c.toFixed(3));
+    el.style.background = `linear-gradient(0deg, rgba(${rgb},${c * 0.16}), rgba(${rgb},${c * 0.16})), var(--card)`;
+    el.style.boxShadow = c > 0.04 ? `0 0 ${(c * 26).toFixed(1)}px rgba(${rgb},${c * 0.5})` : "none";
+    el.style.transform = `translateY(${(-c * 3).toFixed(2)}px)`;
+    el.style.borderColor = tier === "idle" ? "var(--border)" : `rgb(${rgb})`;
+    el.style.color = tier === "idle" ? "#d6d6d6" : "#fff";
+  }
+
   useEffect(() => {
     let raf = 0;
     const tick = (t: number) => {
       const p = pointer.current;
       if (p) {
-        const nextConf: number[] = [];
-        const nextState: ("idle" | Tier)[] = [];
+        const next = tierRef.current.slice();
+        let changed = false;
         for (let i = 0; i < LINKS.length; i++) {
+          const el = cardRefs.current[i];
           const r = rects.current[i];
-          if (!r) { nextConf.push(0); nextState.push("idle"); continue; }
+          if (!el || !r) continue;
           const c = Math.max(
             proximityScore(p.x, p.y, r, 90),
             trajectoryScore(p.x, p.y, vel.current, r),
           );
-          nextConf.push(c);
-
           let s: "idle" | Tier = "idle";
           if (c >= 0.85) {
             if (!armed.current[i]) armed.current[i] = t;
@@ -70,14 +82,13 @@ function LiveDemo() {
           } else {
             armed.current[i] = 0;
           }
-          nextState.push(s);
+          paint(el, c, s);
+          if (s !== next[i]) { next[i] = s; changed = true; }
 
-          // log once per card per approach (reset when it goes idle)
           if (s !== "idle" && !fired.current.has(i)) {
             fired.current.add(i);
             setLog((L) => [{ url: LINKS[i].href, tier: s as Tier, t }, ...L].slice(0, 8));
           } else if (s === "prerender" && fired.current.has(i)) {
-            // upgrade prefetch → prerender in the log
             setLog((L) =>
               L[0]?.url === LINKS[i].href && L[0]?.tier === "prefetch"
                 ? [{ url: LINKS[i].href, tier: "prerender", t }, ...L.slice(1)]
@@ -86,8 +97,8 @@ function LiveDemo() {
           }
           if (s === "idle") fired.current.delete(i);
         }
-        setConf(nextConf);
-        setState(nextState);
+        // One state update per discrete tier change, not per frame.
+        if (changed) { tierRef.current = next; setTiers(next); }
       }
       raf = requestAnimationFrame(tick);
     };
@@ -106,8 +117,9 @@ function LiveDemo() {
     vel.current = { x: 0, y: 0 };
     armed.current = LINKS.map(() => 0);
     fired.current.clear();
-    setConf(LINKS.map(() => 0));
-    setState(LINKS.map(() => "idle"));
+    cardRefs.current.forEach((el) => el && paint(el, 0, "idle"));
+    tierRef.current = LINKS.map(() => "idle");
+    setTiers(LINKS.map(() => "idle"));
   }
 
   return (
@@ -120,11 +132,10 @@ function LiveDemo() {
               ref={(el) => { cardRefs.current[i] = el; }}
               href={l.href}
               onClick={(e) => e.preventDefault()}
-              className={`demo-link ${state[i]}`}
-              style={{ ["--c" as string]: conf[i].toFixed(3) }}
+              className={`demo-link ${tiers[i]}`}
             >
               <span>{l.label}</span>
-              {state[i] !== "idle" && <em className={`tag ${state[i]}`}>{state[i]}</em>}
+              {tiers[i] !== "idle" && <em className={`tag ${tiers[i]}`}>{tiers[i]}</em>}
             </a>
           ))}
         </div>
@@ -152,21 +163,38 @@ function LiveDemo() {
   );
 }
 
-function Code({ children }: { children: string }) {
+function Code({ children, lang = "tsx" }: { children: string; lang?: string }) {
   const [copied, setCopied] = useState(false);
+  const code = children.trim();
   return (
     <div className="code">
       <button
         className="copy"
         onClick={() => {
-          navigator.clipboard?.writeText(children);
+          navigator.clipboard?.writeText(code);
           setCopied(true);
           setTimeout(() => setCopied(false), 1200);
         }}
       >
         {copied ? "copied" : "copy"}
       </button>
-      <pre><code>{children}</code></pre>
+      <Highlight code={code} language={lang} theme={themes.vsDark}>
+        {({ tokens, getLineProps, getTokenProps }) => (
+          <pre>
+            {tokens.map((line, i) => {
+              const { key: _lk, ...lineProps } = getLineProps({ line });
+              return (
+                <span key={i} {...lineProps} style={{ display: "block" }}>
+                  {line.map((token, k) => {
+                    const { key: _tk, ...tokenProps } = getTokenProps({ token });
+                    return <span key={k} {...tokenProps} />;
+                  })}
+                </span>
+              );
+            })}
+          </pre>
+        )}
+      </Highlight>
     </div>
   );
 }

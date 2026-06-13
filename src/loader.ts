@@ -37,10 +37,15 @@ export interface Loader {
 // evict the oldest — least likely to be the next click. The fetch already
 // happened, so eviction only tidies the DOM.
 const MAX_NODES = 50;
+// A prerender is a live, resource-holding page. Removing its rule cancels it, so
+// these are NOT freely evictable — cap at a small budget (matching what Chrome
+// keeps anyway) and, when one is dropped, forget it so it can be recreated.
+const MAX_PRERENDERS = 3;
 
 export function createLoader(limit: number): Loader {
   const loaded = new Map<string, Strategy>();
-  const nodes: HTMLElement[] = [];
+  const nodes: HTMLElement[] = []; // prefetch / link nodes — safe to evict (fetch already happened)
+  const prerenderNodes: { url: string; node: HTMLElement }[] = [];
   let count = 0;
 
   function track(node: HTMLElement) {
@@ -66,7 +71,18 @@ export function createLoader(limit: number): Loader {
       [strategy]: [{ source: "list", urls: [url], eagerness: "immediate" }],
     });
     document.head.appendChild(script);
-    track(script);
+    if (strategy === "prerender") {
+      prerenderNodes.push({ url, node: script });
+      while (prerenderNodes.length > MAX_PRERENDERS) {
+        const old = prerenderNodes.shift();
+        if (old) {
+          old.node.remove();
+          loaded.delete(old.url); // let it be recreated if intent returns
+        }
+      }
+    } else {
+      track(script);
+    }
   }
 
   function addPrefetchLink(url: string) {
@@ -111,7 +127,9 @@ export function createLoader(limit: number): Loader {
     },
     destroy() {
       for (const n of nodes) n.remove();
+      for (const p of prerenderNodes) p.node.remove();
       nodes.length = 0;
+      prerenderNodes.length = 0;
       loaded.clear();
       count = 0;
     },

@@ -59,6 +59,9 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   }
 
   const eligible = makeEligible(opts);
+  // When a non-document root is given, scope everything to it (not just the
+  // initial scan): the MutationObserver and per-anchor checks honor it too.
+  const scopeEl: Element | null = root instanceof Element ? root : null;
   const candidates = new Map<HTMLAnchorElement, Candidate>();
   const visible = new Set<HTMLAnchorElement>();
   const rectCache = new Map<HTMLAnchorElement, DOMRect>();
@@ -70,6 +73,7 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   const vel: Velocity = { x: 0, y: 0 };
   let prevSample: { x: number; y: number; t: number } | null = null;
   let lastMove = 0;
+  let lastMeasure = 0;
   let raf = 0;
 
   // Prerender *runs* the page, so only ever prerender links that look free of
@@ -115,7 +119,7 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   // ---- candidate discovery -------------------------------------------------
 
   function consider(el: HTMLAnchorElement): Candidate | null {
-    const url = eligible(el);
+    const url = scopeEl && !scopeEl.contains(el) ? null : eligible(el);
     const existing = candidates.get(el);
     if (!url) {
       if (existing) drop(el);
@@ -132,7 +136,10 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   }
 
   function drop(el: HTMLAnchorElement) {
-    if (candidates.delete(el)) {
+    const c = candidates.get(el);
+    if (c) {
+      if (c.emitted > 0) emit(el, c, 0, "proximity"); // let a UI affordance clear
+      candidates.delete(el);
       io.unobserve(el);
       visible.delete(el);
       rectCache.delete(el);
@@ -151,12 +158,16 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
           visible.add(el);
           rectCache.set(el, e.boundingClientRect as DOMRect); // fresh at callback time
           if (useViewport) {
-            const c = candidates.get(el);
-            if (c) idle(() => load(el, c.url, 0, false));
+            idle(() => {
+              const cc = candidates.get(el); // re-resolve: href may have changed
+              if (cc && !loadedView.has(cc.url)) load(el, cc.url, 0, false);
+            });
           }
         } else {
           visible.delete(el);
           rectCache.delete(el);
+          const c = candidates.get(el);
+          if (c && c.emitted > 0) emit(el, c, 0, "proximity"); // scrolled away — clear affordance
         }
       }
     },
@@ -196,7 +207,13 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   function tick(t: number) {
     if (destroyed) { raf = 0; return; }
     if (document.hidden || t - lastMove > 500) { raf = 0; return; }
-    if (rectsDirty) refreshRects();
+    // Re-measure on demand (scroll/resize) and on a throttle, so layout shifts
+    // that don't fire scroll/resize (accordions, image/font loads) can't leave
+    // the cache stale. Only the small `visible` set is read, batched.
+    if (rectsDirty || t - lastMeasure > 250) { refreshRects(); lastMeasure = t; }
+    // The velocity EMA only updates on pointermove; if the cursor has paused,
+    // drop the stale heading so trajectory can't fire for a link we stopped short of.
+    if (t - lastMove > 80) { vel.x = 0; vel.y = 0; }
     for (const el of visible) {
       const c = candidates.get(el);
       if (!c || loadedView.has(c.url)) continue;
@@ -288,7 +305,7 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
 
   scan();
   // documentElement, not body — body may be null if intently() runs in <head>.
-  mo.observe(document.documentElement, {
+  mo.observe(scopeEl ?? document.documentElement, {
     childList: true,
     subtree: true,
     attributes: true,

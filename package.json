@@ -1,6 +1,6 @@
 {
   "name": "intently",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Intent-aware prefetching. Predicts where the cursor is headed — proximity + trajectory — and prefetches (or prerenders via the Speculation Rules API) the link a beat before the click. Zero-config, ~4KB, framework-agnostic.",
   "type": "module",
   "license": "MIT",
