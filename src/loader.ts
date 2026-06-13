@@ -32,10 +32,21 @@ export interface Loader {
   destroy(): void;
 }
 
+// Cap how many speculation-rule / prefetch nodes live in <head> at once so a
+// long SPA session (feeds, infinite scroll) doesn't accumulate hundreds. We
+// evict the oldest — least likely to be the next click. The fetch already
+// happened, so eviction only tidies the DOM.
+const MAX_NODES = 50;
+
 export function createLoader(limit: number): Loader {
   const loaded = new Map<string, Strategy>();
   const nodes: HTMLElement[] = [];
   let count = 0;
+
+  function track(node: HTMLElement) {
+    nodes.push(node);
+    while (nodes.length > MAX_NODES) nodes.shift()?.remove();
+  }
 
   const tier: Loader["tier"] = speculationRulesSupported
     ? "speculationrules"
@@ -55,16 +66,15 @@ export function createLoader(limit: number): Loader {
       [strategy]: [{ source: "list", urls: [url], eagerness: "immediate" }],
     });
     document.head.appendChild(script);
-    nodes.push(script);
+    track(script);
   }
 
   function addPrefetchLink(url: string) {
     const link = document.createElement("link");
     link.rel = "prefetch";
-    link.href = url;
-    link.as = "document";
+    link.href = url; // no `as` — document is the implied destination for rel=prefetch
     document.head.appendChild(link);
-    nodes.push(link);
+    track(link);
   }
 
   return {
@@ -88,8 +98,11 @@ export function createLoader(limit: number): Loader {
         if (prior === undefined) addPrefetchLink(url); // link tier can't prerender
       } else {
         if (prior === undefined) {
-          // credentials:'omit' keeps it cacheable + avoids leaking auth on warm-up
-          fetch(url, { credentials: "omit", mode: "no-cors" }).catch(() => {});
+          // Same-origin (eligibility guarantees it): a normal credentialed GET so
+          // the cached response actually matches the real navigation. (no-cors +
+          // omit would store an opaque, credential-mismatched entry the browser
+          // can't reuse — defeating the warm-up.)
+          fetch(url, { credentials: "same-origin" }).catch(() => {});
         }
       }
 

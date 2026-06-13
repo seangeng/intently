@@ -10,7 +10,8 @@ import type { IntentlyHandle, IntentlyOptions, Signal } from "./types";
 
 interface Candidate {
   url: string;
-  armedSince: number; // when confidence first crossed the prerender bar (0 = not armed)
+  armedFrames: number; // consecutive frames above the prerender bar
+  emitted: number; // last confidence sent to onPredict (dedupe)
 }
 
 const DEFAULTS = {
@@ -24,6 +25,12 @@ const DEFAULTS = {
   respectSaveData: true,
 };
 
+const ARM_FRAMES = 8; // ~130ms at 60fps — sustained, not wall-clock (survives idle)
+
+function now() {
+  return typeof performance !== "undefined" ? performance.now() : Date.now();
+}
+
 /**
  * Start intent-aware prefetching. Zero-config: `intently()` binds every
  * eligible same-origin link and prefetches the one the cursor is heading
@@ -34,24 +41,30 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   const root: ParentNode = opts.root ?? (typeof document !== "undefined" ? document : (null as never));
   const loader = createLoader(opts.limit);
 
-  const signals = new Set<Signal>(
-    opts.signals ?? ["trajectory", "proximity", "hover", "touch"],
-  );
+  const signals = new Set<Signal>(opts.signals ?? ["trajectory", "proximity", "hover", "touch"]);
   const useTrajectory = signals.has("trajectory");
   const useProximity = signals.has("proximity");
   const useHover = signals.has("hover");
-  const useTouch = signals.has("touch") && opts.eagerOnPress;
+  const usePress = opts.eagerOnPress; // pointerdown / touchstart — covers touch + mouse
   const useViewport = signals.has("viewport") || opts.viewportPrefetch;
 
-  // No-op safely in non-DOM environments (SSR).
-  if (typeof window === "undefined" || !root || loader.tier === "none" || !shouldRun(opts.respectSaveData)) {
+  // No-op safely in non-DOM environments (SSR) or when we shouldn't run.
+  if (
+    typeof window === "undefined" ||
+    !root ||
+    loader.tier === "none" ||
+    !shouldRun(opts.respectSaveData)
+  ) {
     return { prefetch() {}, prerender() {}, destroy() {}, loaded: new Set() };
   }
 
   const eligible = makeEligible(opts);
   const candidates = new Map<HTMLAnchorElement, Candidate>();
   const visible = new Set<HTMLAnchorElement>();
+  const rectCache = new Map<HTMLAnchorElement, DOMRect>();
   const loadedView = new Set<string>();
+  let rectsDirty = false;
+  let destroyed = false;
 
   const pointer = { x: 0, y: 0 };
   const vel: Velocity = { x: 0, y: 0 };
@@ -59,9 +72,30 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   let lastMove = 0;
   let raf = 0;
 
-  function fire(el: HTMLAnchorElement, url: string, confidence: number, signal: Signal, prerender: boolean) {
+  // Prerender *runs* the page, so only ever prerender links that look free of
+  // side effects: no query string, not nofollow/external, not a new tab.
+  function prerenderSafe(el: HTMLAnchorElement, urlStr: string): boolean {
+    try {
+      if (new URL(urlStr).search) return false;
+    } catch {
+      return false;
+    }
+    const rel = (el.getAttribute("rel") || "").toLowerCase();
+    if (/\b(nofollow|external)\b/.test(rel)) return false;
+    const target = el.getAttribute("target");
+    if (target && target !== "_self") return false;
+    return true;
+  }
+
+  function load(el: HTMLAnchorElement, url: string, confidence: number, wantPrerender: boolean) {
+    if (destroyed) return;
     let strategy: "prefetch" | "prerender" = "prefetch";
-    if (prerender && opts.prerenderThreshold !== false && confidence >= opts.prerenderThreshold) {
+    if (
+      wantPrerender &&
+      opts.prerenderThreshold !== false &&
+      confidence >= opts.prerenderThreshold &&
+      prerenderSafe(el, url)
+    ) {
       strategy = "prerender";
     }
     const used = loader.load(url, strategy);
@@ -69,22 +103,44 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
       loadedView.add(url);
       opts.onLoad?.(url, used);
     }
-    opts.onPredict?.({ el, url, confidence, signal });
+  }
+
+  function emit(el: HTMLAnchorElement, c: Candidate, confidence: number, signal: Signal) {
+    if (!opts.onPredict) return;
+    if (Math.abs(c.emitted - confidence) < 0.02) return; // only on meaningful change
+    c.emitted = confidence;
+    opts.onPredict({ el, url: c.url, confidence, signal });
   }
 
   // ---- candidate discovery -------------------------------------------------
 
-  function consider(el: HTMLAnchorElement) {
-    if (candidates.has(el)) return;
+  function consider(el: HTMLAnchorElement): Candidate | null {
     const url = eligible(el);
-    if (!url) return;
-    candidates.set(el, { url, armedSince: 0 });
+    const existing = candidates.get(el);
+    if (!url) {
+      if (existing) drop(el);
+      return null;
+    }
+    if (existing) {
+      existing.url = url; // href changed in place (SPA routers) — keep it fresh
+      return existing;
+    }
+    const c: Candidate = { url, armedFrames: 0, emitted: -1 };
+    candidates.set(el, c);
     io.observe(el);
+    return c;
+  }
+
+  function drop(el: HTMLAnchorElement) {
+    if (candidates.delete(el)) {
+      io.unobserve(el);
+      visible.delete(el);
+      rectCache.delete(el);
+    }
   }
 
   function scan() {
-    const links = root.querySelectorAll<HTMLAnchorElement>("a[href]");
-    links.forEach(consider);
+    root.querySelectorAll<HTMLAnchorElement>("a[href]").forEach(consider);
   }
 
   const io = new IntersectionObserver(
@@ -93,12 +149,14 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
         const el = e.target as HTMLAnchorElement;
         if (e.isIntersecting) {
           visible.add(el);
+          rectCache.set(el, e.boundingClientRect as DOMRect); // fresh at callback time
           if (useViewport) {
             const c = candidates.get(el);
-            if (c) requestIdle(() => fire(el, c.url, 0, "viewport", false));
+            if (c) idle(() => load(el, c.url, 0, false));
           }
         } else {
           visible.delete(el);
+          rectCache.delete(el);
         }
       }
     },
@@ -107,60 +165,66 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
 
   const mo = new MutationObserver((muts) => {
     for (const m of muts) {
+      if (m.type === "attributes") {
+        if (m.target instanceof HTMLAnchorElement) consider(m.target);
+        continue;
+      }
       m.addedNodes.forEach((n) => {
         if (!(n instanceof Element)) return;
-        if (n.matches?.("a[href]")) consider(n as HTMLAnchorElement);
+        if ((n as Element).matches?.("a[href]")) consider(n as HTMLAnchorElement);
         n.querySelectorAll?.<HTMLAnchorElement>("a[href]").forEach(consider);
       });
       m.removedNodes.forEach((n) => {
         if (!(n instanceof Element)) return;
-        const drop = (el: Element) => {
-          const a = el as HTMLAnchorElement;
-          if (candidates.delete(a)) {
-            io.unobserve(a);
-            visible.delete(a);
-          }
-        };
-        if (n.matches?.("a[href]")) drop(n);
-        n.querySelectorAll?.("a[href]").forEach(drop);
+        if ((n as Element).matches?.("a[href]")) drop(n as HTMLAnchorElement);
+        n.querySelectorAll?.("a[href]").forEach((el) => drop(el as HTMLAnchorElement));
       });
     }
   });
 
-  // ---- the scoring loop ----------------------------------------------------
+  // ---- the scoring loop (cached rects — no per-frame layout reads) ----------
 
-  function tick(now: number) {
-    if (document.hidden || now - lastMove > 500) {
-      raf = 0; // go idle until the next move
-      return;
-    }
+  function refreshRects() {
+    for (const el of visible) rectCache.set(el, el.getBoundingClientRect());
+    rectsDirty = false;
+  }
+
+  function kick() {
+    if (!raf && !destroyed && (useProximity || useTrajectory)) raf = requestAnimationFrame(tick);
+  }
+
+  function tick(t: number) {
+    if (destroyed) { raf = 0; return; }
+    if (document.hidden || t - lastMove > 500) { raf = 0; return; }
+    if (rectsDirty) refreshRects();
     for (const el of visible) {
       const c = candidates.get(el);
       if (!c || loadedView.has(c.url)) continue;
-      const r = el.getBoundingClientRect();
+      const r = rectCache.get(el);
+      if (!r) continue;
       const prox = useProximity ? proximityScore(pointer.x, pointer.y, r, opts.proximityRadius) : 0;
       const traj = useTrajectory ? trajectoryScore(pointer.x, pointer.y, vel, r) : 0;
       const confidence = Math.max(prox, traj);
-      if (confidence < 0.05) {
-        c.armedSince = 0;
-        continue;
-      }
       const signal: Signal = traj >= prox ? "trajectory" : "proximity";
 
-      // Prerender wants sustained high confidence, not a flicker.
-      let prerender = false;
-      if (opts.prerenderThreshold !== false && confidence >= opts.prerenderThreshold) {
-        if (!c.armedSince) c.armedSince = now;
-        else if (now - c.armedSince > 120) prerender = true;
-      } else {
-        c.armedSince = 0;
+      if (confidence < 0.05) {
+        c.armedFrames = 0;
+        emit(el, c, 0, signal);
+        continue;
       }
 
-      if (confidence >= opts.intentThreshold || prerender) {
-        fire(el, c.url, confidence, signal, prerender);
-      } else if (opts.onPredict) {
-        opts.onPredict({ el, url: c.url, confidence, signal });
+      let wantPrerender = false;
+      if (opts.prerenderThreshold !== false && confidence >= opts.prerenderThreshold) {
+        c.armedFrames++;
+        if (c.armedFrames >= ARM_FRAMES) wantPrerender = true;
+      } else {
+        c.armedFrames = 0;
       }
+
+      if (confidence >= opts.intentThreshold || wantPrerender) {
+        load(el, c.url, confidence, wantPrerender);
+      }
+      emit(el, c, confidence, signal);
     }
     raf = requestAnimationFrame(tick);
   }
@@ -168,59 +232,80 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
   // ---- event wiring --------------------------------------------------------
 
   function onMove(e: PointerEvent) {
-    const t = e.timeStamp;
-    updateVelocity(vel, prevSample, e.clientX, e.clientY, t);
-    prevSample = { x: e.clientX, y: e.clientY, t };
+    updateVelocity(vel, prevSample, e.clientX, e.clientY, e.timeStamp);
+    prevSample = { x: e.clientX, y: e.clientY, t: e.timeStamp };
     pointer.x = e.clientX;
     pointer.y = e.clientY;
-    lastMove = typeof performance !== "undefined" ? performance.now() : t;
-    if (!raf && (useProximity || useTrajectory)) raf = requestAnimationFrame(tick);
+    lastMove = now();
+    kick();
   }
 
   let hovered: HTMLAnchorElement | null = null;
   let hoverTimer = 0;
   function onOver(e: PointerEvent) {
-    if (!useHover) return;
     const a = (e.target as Element)?.closest?.("a[href]") as HTMLAnchorElement | null;
     if (!a || a === hovered) return;
     hovered = a;
     clearTimeout(hoverTimer);
-    const c = candidates.get(a);
+    const c = consider(a);
     if (!c || loadedView.has(c.url)) return;
     hoverTimer = window.setTimeout(() => {
-      if (hovered === a) fire(a, c.url, 1, "hover", true);
+      if (hovered === a) load(a, c.url, 1, true);
     }, opts.hoverDelay);
   }
-  function onOut() {
+  function onOut(e: PointerEvent) {
+    // pointerout fires when crossing onto a child of the link — ignore those.
+    if (hovered && e.relatedTarget instanceof Node && hovered.contains(e.relatedTarget)) return;
     hovered = null;
     clearTimeout(hoverTimer);
   }
 
   function onPress(e: Event) {
-    if (!useTouch) return;
     const a = (e.target as Element)?.closest?.("a[href]") as HTMLAnchorElement | null;
     if (!a) return;
-    const c = candidates.get(a);
-    if (c && !loadedView.has(c.url)) fire(a, c.url, 1, "touch", false);
+    const c = consider(a);
+    if (c && !loadedView.has(c.url)) load(a, c.url, 1, false);
   }
 
-  function requestIdle(fn: () => void) {
+  function onScroll() {
+    rectsDirty = true;
+  }
+  function onVisibility() {
+    if (!document.hidden) {
+      lastMove = now();
+      kick();
+    }
+  }
+
+  function idle(fn: () => void) {
     const ric = (window as Window & { requestIdleCallback?: (cb: () => void) => number }).requestIdleCallback;
-    if (ric) ric(fn);
-    else setTimeout(fn, 1);
+    const guarded = () => { if (!destroyed) fn(); };
+    if (ric) ric(guarded);
+    else setTimeout(guarded, 1);
   }
 
   // ---- boot ----------------------------------------------------------------
 
   scan();
-  mo.observe(root === document ? document.body : (root as Node), { childList: true, subtree: true });
+  // documentElement, not body — body may be null if intently() runs in <head>.
+  mo.observe(document.documentElement, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["href"],
+  });
   window.addEventListener("pointermove", onMove, { passive: true });
-  if (useHover) window.addEventListener("pointerover", onOver, { passive: true });
-  window.addEventListener("pointerout", onOut, { passive: true });
-  if (useTouch) {
+  if (useHover) {
+    window.addEventListener("pointerover", onOver, { passive: true });
+    window.addEventListener("pointerout", onOut, { passive: true });
+  }
+  if (usePress) {
     window.addEventListener("pointerdown", onPress, { passive: true });
     window.addEventListener("touchstart", onPress, { passive: true });
   }
+  window.addEventListener("scroll", onScroll, { passive: true, capture: true });
+  window.addEventListener("resize", onScroll, { passive: true });
+  document.addEventListener("visibilitychange", onVisibility);
 
   return {
     prefetch: (url) => {
@@ -232,6 +317,7 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
       if (used) loadedView.add(url);
     },
     destroy() {
+      destroyed = true;
       if (raf) cancelAnimationFrame(raf);
       clearTimeout(hoverTimer);
       io.disconnect();
@@ -241,9 +327,13 @@ export function intently(options: IntentlyOptions = {}): IntentlyHandle {
       window.removeEventListener("pointerout", onOut);
       window.removeEventListener("pointerdown", onPress);
       window.removeEventListener("touchstart", onPress);
+      window.removeEventListener("scroll", onScroll, { capture: true });
+      window.removeEventListener("resize", onScroll);
+      document.removeEventListener("visibilitychange", onVisibility);
       loader.destroy();
       candidates.clear();
       visible.clear();
+      rectCache.clear();
     },
     loaded: loadedView,
   };

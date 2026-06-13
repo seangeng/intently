@@ -20,18 +20,17 @@ import type { IntentlyHandle, IntentlyOptions } from "./types";
  */
 export function useIntently(options: IntentlyOptions = {}): { current: IntentlyHandle | null } {
   const handle = useRef<IntentlyHandle | null>(null);
-  // Keep the latest options without re-initializing on every render.
-  const optsRef = useRef(options);
-  optsRef.current = options;
 
   useEffect(() => {
-    const h = intently(optsRef.current);
+    // Options are captured once on mount — intently is a global, page-lifetime
+    // listener, so changing options means tearing down and remounting (give the
+    // component a `key`). This is deliberate, not a stale-closure oversight.
+    const h = intently(options);
     handle.current = h;
     return () => {
       h.destroy();
       handle.current = null;
     };
-    // Intentionally mount-once; change behavior by tearing down + remounting.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 

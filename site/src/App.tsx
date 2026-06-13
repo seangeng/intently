@@ -30,6 +30,18 @@ function LiveDemo() {
   const prev = useRef<{ x: number; y: number; t: number } | null>(null);
   const armed = useRef<number[]>(LINKS.map(() => 0));
   const fired = useRef<Set<number>>(new Set());
+  // Cache link rects so the hot loop never calls getBoundingClientRect — only
+  // re-measure on resize and when the pointer (re-)enters the stage.
+  const rects = useRef<(DOMRect | null)[]>([]);
+  function measure() {
+    rects.current = cardRefs.current.map((el) => el?.getBoundingClientRect() ?? null);
+  }
+
+  useEffect(() => {
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+  }, []);
 
   useEffect(() => {
     let raf = 0;
@@ -39,9 +51,8 @@ function LiveDemo() {
         const nextConf: number[] = [];
         const nextState: ("idle" | Tier)[] = [];
         for (let i = 0; i < LINKS.length; i++) {
-          const el = cardRefs.current[i];
-          if (!el) { nextConf.push(0); nextState.push("idle"); continue; }
-          const r = el.getBoundingClientRect();
+          const r = rects.current[i];
+          if (!r) { nextConf.push(0); nextState.push("idle"); continue; }
           const c = Math.max(
             proximityScore(p.x, p.y, r, 90),
             trajectoryScore(p.x, p.y, vel.current, r),
@@ -160,11 +171,90 @@ function Code({ children }: { children: string }) {
   );
 }
 
+function Bar({ label, ms, width, tone, sub, instant }: {
+  label: string; ms: number; width: string; tone: string; sub: string; instant?: boolean;
+}) {
+  return (
+    <div className="bar-row">
+      <div className="bar-head"><span>{label}</span><b>{instant ? "≈ instant" : `${ms}ms`}</b></div>
+      <div className="bar-track"><i className={`bar-fill ${tone}`} style={{ width }} /></div>
+      <span className="bar-sub">{sub}</span>
+    </div>
+  );
+}
+
+const SIZES = [
+  { name: "instant.page", kb: 1.3 },
+  { name: "quicklink", kb: 2.4 },
+  { name: "intently", kb: 4.0, me: true },
+  { name: "ForesightJS", kb: 5.5 },
+];
+
+function Stats() {
+  const [load, setLoad] = useState(800);
+  const [lead, setLead] = useState(250);
+  const prefetch = Math.max(0, load - lead);
+  const max = Math.max(load, 1);
+  const pct = (ms: number) => `${Math.max(2, (ms / max) * 100)}%`;
+  const maxKb = Math.max(...SIZES.map((s) => s.kb));
+
+  return (
+    <section className="stats">
+      <h2>The numbers</h2>
+      <p className="muted">
+        No fabricated benchmarks — real savings depend on your page and your
+        users. This is the mechanism with <em>your</em> inputs, plus real bundle
+        sizes.
+      </p>
+
+      <div className="model">
+        <div className="model-controls">
+          <label>
+            page load time <b>{load}ms</b>
+            <input type="range" min={200} max={2000} step={50} value={load} onChange={(e) => setLoad(+e.target.value)} />
+          </label>
+          <label>
+            intent lead time <b>{lead}ms</b>
+            <input type="range" min={50} max={500} step={25} value={lead} onChange={(e) => setLead(+e.target.value)} />
+          </label>
+        </div>
+        <div className="bars">
+          <Bar label="No prefetch" ms={load} width={pct(load)} tone="base" sub="click → wait for the whole load" />
+          <Bar label="intently · prefetch" ms={prefetch} width={pct(prefetch)} tone="prefetch" sub={`load starts ${lead}ms early, on intent`} />
+          <Bar label="intently · prerender" ms={0} width="2%" tone="prerender" sub="page already built — instant swap" instant />
+        </div>
+        <p className="muted small">
+          Perceived wait <em>after</em> the click. Prefetch removes up to the lead
+          window; prerender removes the load entirely (the page is already
+          rendered in a hidden tab). Lead time varies — instant.page measures
+          ~300ms on hover; trajectory fires earlier.
+        </p>
+      </div>
+
+      <div className="sizes">
+        <h3>Bundle size</h3>
+        {SIZES.map((s) => (
+          <div key={s.name} className={`size-row ${s.me ? "me" : ""}`}>
+            <span className="size-name">{s.name}</span>
+            <span className="size-bar"><i style={{ width: `${(s.kb / maxKb) * 100}%` }} /></span>
+            <span className="size-kb">{s.kb} KB</span>
+          </div>
+        ))}
+        <p className="muted small">
+          gzip, via bundlephobia (Jun 2026). intently costs a little more than the
+          hover/viewport tools because it also predicts trajectory and drives
+          prerender tiers — still tiny, and lighter than ForesightJS.
+        </p>
+      </div>
+    </section>
+  );
+}
+
 export function App() {
   return (
     <main>
       <header className="hero">
-        <div className="badge">~3.5KB · zero-config · MIT</div>
+        <div className="badge">~4KB · zero-config · MIT</div>
         <h1>intently</h1>
         <p className="tag-line">
           Intent-aware prefetching. It watches where your cursor is <em>headed</em> —
@@ -236,6 +326,8 @@ function App() {
   onPredict: ({ url, confidence }) => {}, // wire a visual affordance
 });`}</Code>
       </section>
+
+      <Stats />
 
       <section>
         <h2>Versus the others</h2>
