@@ -4,12 +4,12 @@
   "compatibility_date": "2026-03-01",
   "assets": {
     "directory": "./dist",
-    "not_found_handling": "single-page-application"
-  }
-  // No custom domain yet — deploys to intently.<account>.workers.dev.
-  // To attach intently.dev later, add it as a zone in this Cloudflare account, then:
-  // "routes": [
-  //   { "pattern": "intently.dev", "custom_domain": true },
-  //   { "pattern": "www.intently.dev", "custom_domain": true }
-  // ]
+    // Multi-page site — serve real .html documents (Cloudflare maps /docs → /docs.html),
+    // not an SPA fallback. This is what lets intently prefetch/prerender real pages.
+    "not_found_handling": "none"
+  },
+  "routes": [
+    { "pattern": "intentlyjs.com", "custom_domain": true },
+    { "pattern": "www.intentlyjs.com", "custom_domain": true }
+  ]
 }

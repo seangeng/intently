@@ -1,6 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Highlight, themes } from "prism-react-renderer";
 import { proximityScore, trajectoryScore, updateVelocity, type Velocity } from "intently";
+
+/* ================================================================== */
+/* 1. Live prediction demo — cursor → confidence → prefetch/prerender  */
+/* ================================================================== */
 
 const LINKS = [
   { label: "Pricing", href: "/pricing" },
@@ -12,15 +15,14 @@ const LINKS = [
 ];
 
 type Tier = "prefetch" | "prerender";
-interface LogEntry { url: string; tier: Tier; t: number }
+interface LogEntry { url: string; tier: Tier }
 
 const srSupported =
   typeof HTMLScriptElement !== "undefined" &&
   typeof HTMLScriptElement.supports === "function" &&
   HTMLScriptElement.supports("speculationrules");
 
-function LiveDemo() {
-  const zoneRef = useRef<HTMLDivElement>(null);
+export function LiveDemo() {
   const cardRefs = useRef<(HTMLAnchorElement | null)[]>([]);
   const [tiers, setTiers] = useState<("idle" | Tier)[]>(() => LINKS.map(() => "idle"));
   const [log, setLog] = useState<LogEntry[]>([]);
@@ -30,22 +32,22 @@ function LiveDemo() {
   const prev = useRef<{ x: number; y: number; t: number } | null>(null);
   const armed = useRef<number[]>(LINKS.map(() => 0));
   const fired = useRef<Set<number>>(new Set());
-  // Cache link rects so the hot loop never calls getBoundingClientRect — only
-  // re-measure on resize and when the pointer (re-)enters the stage.
   const rects = useRef<(DOMRect | null)[]>([]);
   const tierRef = useRef<("idle" | Tier)[]>(LINKS.map(() => "idle"));
+
   function measure() {
     rects.current = cardRefs.current.map((el) => el?.getBoundingClientRect() ?? null);
   }
-
   useEffect(() => {
     measure();
     window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
+    window.addEventListener("scroll", measure, { passive: true });
+    return () => {
+      window.removeEventListener("resize", measure);
+      window.removeEventListener("scroll", measure);
+    };
   }, []);
 
-  // Paint a card's confidence straight to the DOM. The hot path never touches
-  // React state, so there's no 60fps reconcile — that was the jank.
   function paint(el: HTMLAnchorElement, c: number, tier: "idle" | Tier) {
     const rgb = tier === "prerender" ? "34,197,94" : "59,130,246";
     el.style.setProperty("--c", c.toFixed(3));
@@ -84,20 +86,18 @@ function LiveDemo() {
           }
           paint(el, c, s);
           if (s !== next[i]) { next[i] = s; changed = true; }
-
           if (s !== "idle" && !fired.current.has(i)) {
             fired.current.add(i);
-            setLog((L) => [{ url: LINKS[i].href, tier: s as Tier, t }, ...L].slice(0, 8));
+            setLog((L) => [{ url: LINKS[i].href, tier: s as Tier }, ...L].slice(0, 8));
           } else if (s === "prerender" && fired.current.has(i)) {
             setLog((L) =>
               L[0]?.url === LINKS[i].href && L[0]?.tier === "prefetch"
-                ? [{ url: LINKS[i].href, tier: "prerender", t }, ...L.slice(1)]
+                ? [{ url: LINKS[i].href, tier: "prerender" }, ...L.slice(1)]
                 : L,
             );
           }
           if (s === "idle") fired.current.delete(i);
         }
-        // One state update per discrete tier change, not per frame.
         if (changed) { tierRef.current = next; setTiers(next); }
       }
       raf = requestAnimationFrame(tick);
@@ -124,7 +124,7 @@ function LiveDemo() {
 
   return (
     <div className="demo">
-      <div className="demo-stage" ref={zoneRef} onPointerMove={onMove} onPointerLeave={onLeave}>
+      <div className="demo-stage" onPointerMove={onMove} onPointerLeave={onLeave}>
         <div className="demo-nav">
           {LINKS.map((l, i) => (
             <a
@@ -163,41 +163,74 @@ function LiveDemo() {
   );
 }
 
-function Code({ children, lang = "tsx" }: { children: string; lang?: string }) {
-  const [copied, setCopied] = useState(false);
-  const code = children.trim();
-  return (
-    <div className="code">
-      <button
-        className="copy"
-        onClick={() => {
-          navigator.clipboard?.writeText(code);
-          setCopied(true);
-          setTimeout(() => setCopied(false), 1200);
-        }}
-      >
-        {copied ? "copied" : "copy"}
-      </button>
-      <Highlight code={code} language={lang} theme={themes.vsDark}>
-        {({ tokens, getLineProps, getTokenProps }) => (
-          <pre>
-            {tokens.map((line, i) => {
-              const { key: _lk, ...lineProps } = getLineProps({ line });
-              return (
-                <span key={i} {...lineProps} style={{ display: "block" }}>
-                  {line.map((token, k) => {
-                    const { key: _tk, ...tokenProps } = getTokenProps({ token });
-                    return <span key={k} {...tokenProps} />;
-                  })}
-                </span>
-              );
-            })}
-          </pre>
+/* ================================================================== */
+/* 2. Speed race — the click-to-paint gap, made visible                */
+/* ================================================================== */
+
+const LATENCY = 700; // simulated server latency, ms
+
+export function Race() {
+  const [left, setLeft] = useState<{ phase: "idle" | "loading" | "done"; ms: number }>({ phase: "idle", ms: 0 });
+  const [right, setRight] = useState<{ phase: "idle" | "loading" | "done"; ms: number }>({ phase: "idle", ms: 0 });
+  const timers = useRef<number[]>([]);
+
+  function run() {
+    timers.current.forEach(clearTimeout);
+    timers.current = [];
+    setLeft({ phase: "loading", ms: 0 });
+    setRight({ phase: "loading", ms: 0 });
+    // Right was prefetched — paints next frame.
+    timers.current.push(window.setTimeout(() => setRight({ phase: "done", ms: 0 }), 60));
+    // Left waits for the network.
+    const start = performance.now();
+    timers.current.push(
+      window.setTimeout(() => setLeft({ phase: "done", ms: Math.round(performance.now() - start) }), LATENCY),
+    );
+  }
+  function reset() {
+    timers.current.forEach(clearTimeout);
+    setLeft({ phase: "idle", ms: 0 });
+    setRight({ phase: "idle", ms: 0 });
+  }
+  useEffect(() => () => timers.current.forEach(clearTimeout), []);
+
+  const Panel = ({ title, sub, state, tone }: {
+    title: string; sub: string; state: { phase: string; ms: number }; tone: string;
+  }) => (
+    <div className={`race-panel ${tone}`}>
+      <div className="race-bar"><span className="dot r" /><span className="dot y" /><span className="dot g" /><code>/pricing</code></div>
+      <div className="race-view">
+        {state.phase === "idle" && <span className="muted small">click “navigate” →</span>}
+        {state.phase === "loading" && <span className="race-spin" />}
+        {state.phase === "done" && (
+          <div className="race-page">
+            <div className="rp-h" /><div className="rp-l" /><div className="rp-l short" /><div className="rp-l" />
+            <span className="race-ms">{state.ms === 0 ? "instant" : `${state.ms}ms`}</span>
+          </div>
         )}
-      </Highlight>
+      </div>
+      <div className="race-foot"><b>{title}</b><em>{sub}</em></div>
+    </div>
+  );
+
+  return (
+    <div className="race">
+      <div className="race-grid">
+        <Panel title="Without prefetch" sub="waits for the server" state={left} tone="base" />
+        <Panel title="With intently" sub="already prefetched on intent" state={right} tone="prerender" />
+      </div>
+      <div className="race-controls">
+        <button className="btn primary" onClick={run}>navigate ↵</button>
+        <button className="btn" onClick={reset}>reset</button>
+        <span className="muted small">Simulated {LATENCY}ms latency, to make the gap visible.</span>
+      </div>
     </div>
   );
 }
+
+/* ================================================================== */
+/* 3. The numbers — perceived-load model + real bundle sizes           */
+/* ================================================================== */
 
 function Bar({ label, ms, width, tone, sub, instant }: {
   label: string; ms: number; width: string; tone: string; sub: string; instant?: boolean;
@@ -218,7 +251,7 @@ const SIZES = [
   { name: "ForesightJS", kb: 5.5 },
 ];
 
-function Stats() {
+export function Stats() {
   const [load, setLoad] = useState(800);
   const [lead, setLead] = useState(250);
   const prefetch = Math.max(0, load - lead);
@@ -227,12 +260,11 @@ function Stats() {
   const maxKb = Math.max(...SIZES.map((s) => s.kb));
 
   return (
-    <section className="stats">
+    <section className="stats" id="numbers">
       <h2>The numbers</h2>
       <p className="muted">
         No fabricated benchmarks — real savings depend on your page and your
-        users. This is the mechanism with <em>your</em> inputs, plus real bundle
-        sizes.
+        users. This is the mechanism with <em>your</em> inputs, plus real bundle sizes.
       </p>
 
       <div className="model">
@@ -253,9 +285,8 @@ function Stats() {
         </div>
         <p className="muted small">
           Perceived wait <em>after</em> the click. Prefetch removes up to the lead
-          window; prerender removes the load entirely (the page is already
-          rendered in a hidden tab). Lead time varies — instant.page measures
-          ~300ms on hover; trajectory fires earlier.
+          window; prerender removes the load entirely. Lead time varies —
+          instant.page measures ~300ms on hover; trajectory fires earlier.
         </p>
       </div>
 
@@ -275,123 +306,5 @@ function Stats() {
         </p>
       </div>
     </section>
-  );
-}
-
-export function App() {
-  return (
-    <main>
-      <header className="hero">
-        <div className="badge">~4KB · zero-config · MIT</div>
-        <h1>intently</h1>
-        <p className="tag-line">
-          Intent-aware prefetching. It watches where your cursor is <em>headed</em> —
-          not just what's on screen or what you've hovered — and loads the next page
-          a beat before you click.
-        </p>
-        <div className="cta">
-          <code className="install">npm i intently</code>
-          <a className="btn" href="https://github.com/seangeng/intently">GitHub</a>
-          <a className="btn" href="https://www.npmjs.com/package/intently">npm</a>
-        </div>
-      </header>
-
-      <section>
-        <LiveDemo />
-      </section>
-
-      <section className="how">
-        <h2>How it works</h2>
-        <div className="steps">
-          <div>
-            <span className="n">1</span>
-            <h3>Predict</h3>
-            <p>
-              Per <code>pointermove</code>, a smoothed velocity plus each link's
-              geometry give two scores — proximity (distance to its nearest edge)
-              and trajectory (are you aimed at it?). The higher is the confidence
-              it's your next click.
-            </p>
-          </div>
-          <div>
-            <span className="n">2</span>
-            <h3>Tier by confidence</h3>
-            <p>
-              Crossing the intent bar prefetches. Sustained high confidence
-              upgrades to a <em>prerender</em> — the next page built in a hidden
-              tab, so the click is instant. Prerender stays rare and high-bar.
-            </p>
-          </div>
-          <div>
-            <span className="n">3</span>
-            <h3>Load, best backend first</h3>
-            <p>
-              The native Speculation Rules API where available (real prefetch and
-              prerender), falling back to <code>&lt;link rel=prefetch&gt;</code> and
-              then a low-priority <code>fetch</code>. Offscreen links cost nothing.
-            </p>
-          </div>
-        </div>
-      </section>
-
-      <section className="install-section">
-        <h2>Drop it in</h2>
-        <Code>{`import { intently } from "intently";
-
-intently(); // binds every eligible <a>, prefetches what you're heading toward`}</Code>
-        <p className="muted">React:</p>
-        <Code>{`import { useIntently } from "intently/react";
-
-function App() {
-  useIntently();
-  return <Routes />;
-}`}</Code>
-        <p className="muted">Tune it:</p>
-        <Code>{`intently({
-  ignores: [/\\/logout/, "?add-to-cart"], // never touch side-effect links
-  prerenderThreshold: 0.85,               // false to disable prerender
-  proximityRadius: 80,
-  onPredict: ({ url, confidence }) => {}, // wire a visual affordance
-});`}</Code>
-      </section>
-
-      <Stats />
-
-      <section>
-        <h2>Versus the others</h2>
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr><th></th><th>signal</th><th>zero-config</th><th>prerender</th></tr>
-            </thead>
-            <tbody>
-              <tr><td>quicklink</td><td>viewport + idle</td><td>yes</td><td>via SR</td></tr>
-              <tr><td>instant.page</td><td>hover (65ms)</td><td>yes</td><td>no</td></tr>
-              <tr><td>ForesightJS</td><td>trajectory</td><td>register elements</td><td>no</td></tr>
-              <tr className="me"><td>intently</td><td>trajectory + proximity</td><td>yes</td><td>yes (tiered)</td></tr>
-            </tbody>
-          </table>
-        </div>
-        <p className="muted small">
-          Trajectory prediction is well-trodden — ForesightJS does it well, and
-          there's cursor-extrapolation patent prior art going back years.
-          intently's bet is prediction + the right modern loader + nothing to
-          configure, in one drop-in.
-        </p>
-      </section>
-
-      <footer>
-        <p>
-          By <a href="https://seangeng.com">Sean Geng</a> · the{" "}
-          <a href="https://seangeng.com/writing/prefetching-on-intent">writeup</a> ·{" "}
-          <a href="https://github.com/seangeng/intently">GitHub</a> ·{" "}
-          <a href="https://www.npmjs.com/package/intently">npm</a> · MIT
-        </p>
-        <p className="muted small">
-          Credits: ForesightJS, instant.page, quicklink, the Speculation Rules
-          API, and my own input-anticipation work.
-        </p>
-      </footer>
-    </main>
   );
 }

@@ -2,7 +2,7 @@
 
 **Intent-aware prefetching.** Most prefetchers load every link in the viewport, or wait for a hover. intently watches where the cursor is actually *heading* — proximity and trajectory, the same prediction that powers a focus ring that warms as you approach — and prefetches (or **prerenders**, via the native Speculation Rules API) the link a beat before you click. Zero-config, ~4KB, framework-agnostic.
 
-[**live demo**](https://intently.seangeng94.workers.dev) · [npm](https://www.npmjs.com/package/intently) · [GitHub](https://github.com/seangeng/intently) · [the writeup](https://seangeng.com/writing/prefetching-on-intent)
+[**intentlyjs.com**](https://intentlyjs.com) · [npm](https://www.npmjs.com/package/intently) · [GitHub](https://github.com/seangeng/intently) · [the writeup](https://seangeng.com/writing/prefetching-on-intent)
 
 ```bash
 npm i intently
